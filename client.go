@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	auth "github.com/bbqtd/go-steam-authenticator"
+	"log"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -20,43 +22,61 @@ const (
 )
 
 type Client struct {
-	HttpClient http.Client
-	apiKey     string
-	username   string
-	password   string
+	HttpClient     *http.Client
+	Auth           *auth.Authenticator
+	sharedSecret   string
+	identitySecret string
+	apiKey         string
+	username       string
+	password       string
 }
 
-func NewClient(username string, password string, apiKey string) *Client {
-	return &Client{
-		HttpClient: http.Client{
+func NewClient(username string, password string, apiKey string, sharedSecret string, identitySecret string) (*Client, error) {
+	client := &Client{
+		HttpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		apiKey:   apiKey,
-		username: username,
-		password: password,
+		sharedSecret:   sharedSecret,
+		identitySecret: identitySecret,
+		apiKey:         apiKey,
+		username:       username,
+		password:       password,
 	}
+	authenticator, err := auth.New(sharedSecret, identitySecret, func() uint64 {
+		return auth.CurrentTime()
+	})
+	if err != nil {
+		return client, err
+	}
+	client.Auth = authenticator
+
+	return client, nil
 }
 
-/*
-Login flow:
-- /getrsakey/
-- encrypt password using former key
--             'password': encrypted_password,
-            'username': self.username,
-            'twofactorcode': self.one_time_code,
-            'emailauth': '',
-            'loginfriendlyname': '',
-            'captchagid': '-1',
-            'captcha_text': '',
-            'emailsteamid': '',
-            'rsatimestamp': rsa_timestamp,
-            'remember_login': 'true',
-            'donotcache': str(int(time.time() * 1000))
-- /login/dologin
--
-*/
-func (c *Client) Login() {
+// TODO: Return login status so we can handle e.g. captcha.
+func (c *Client) Login() error {
+	rsakey, err := c.getRsaKey()
+	if err != nil {
+		return err
+	}
+	pass, err := c.encryptPassword(rsakey)
+	if err != nil {
+		return err
+	}
+	resp, err := c.doLogin(rsakey, pass, "")
+	if err != nil {
+		return err
+	}
 
+	if resp.Requires2FA {
+		a := c.Auth.AuthCode()
+		resp, err = c.doLogin(rsakey, pass, a)
+		if err != nil {
+			return err
+		}
+	}
+	log.Printf("%#v", resp)
+	return nil
 }
 
 type loginKeyResponse struct {
@@ -65,9 +85,12 @@ type loginKeyResponse struct {
 	PublicKeyExp string `json:"publickey_exp"`
 	Timestamp    string `json:"timestamp"`
 }
+
 type doLoginResponse struct {
-	Success     bool `json:"success"`
-	Requires2FA bool `json:"requires_twofactor"`
+	Success       bool   `json:"success"`
+	Requires2FA   bool   `json:"requires_twofactor"`
+	CaptchaNeeded bool   `json:"captcha_needed"`
+	CaptchaGid    string `json:"captcha_gid"`
 }
 
 func (c *Client) getRsaKey() (loginKeyResponse, error) {
@@ -112,12 +135,13 @@ func (c *Client) encryptPassword(rsaKey loginKeyResponse) (string, error) {
 	return base64.StdEncoding.EncodeToString(encrypted), nil
 }
 
-func (c *Client) doLogin(lkr loginKeyResponse, pass string) (doLoginResponse, error) {
+func (c *Client) doLogin(lkr loginKeyResponse, pass string, code string) (doLoginResponse, error) {
 	var loginResp doLoginResponse
+
 	resp, err := http.PostForm(COMMUNITY_URL+"/login/dologin", url.Values{
 		"password":          []string{pass},
 		"username":          []string{c.username},
-		"twofactorcode":     []string{},
+		"twofactorcode":     []string{code},
 		"loginfriendlyname": []string{},
 		"captchagid":        []string{"-1"},
 		"captcha_text":      []string{},
